@@ -1,0 +1,274 @@
+#include <windows.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <chrono>
+#include <vector>
+#include <cmath>
+#include <urlmon.h>
+#include <shellapi.h>
+#include <thread>
+#include <string>
+#include <fstream>
+
+#pragma comment (lib, "Gdiplus.lib")
+#pragma comment (lib, "User32.lib")
+#pragma comment (lib, "urlmon.lib")
+#pragma comment (lib, "Shell32.lib")
+
+using namespace Gdiplus;
+ULONG_PTR gdiplusToken;
+
+// --- СОСТОЯНИЯ ---
+enum State { LOGIN, LOADING, MENU };
+enum Theme { CLASSIC, NEON };
+State currentState = LOGIN;
+Theme currentTheme = NEON;
+
+// --- ССЫЛКИ (ФИКС: ПЕРЕМЕННЫЕ НАЗВАНЫ ПРАВИЛЬНО И ССЫЛКИ RAW) ---
+const wchar_t* keysUrl = L"https://github.com/apap5964-ai/files/raw/refs/heads/main/keys.txt";
+const wchar_t* zipUrl = L"https://github.com/apap5964-ai/files/raw/refs/heads/main/cheats2.zip";
+
+// --- ЛОГИКА ---
+std::wstring userKey = L"";
+bool keyError = false;
+float loginAlpha = 0.0f;
+float angle = 0.0f, angle2 = 0.0f, angle3 = 0.0f;
+float currentW = 380.0f, currentH = 240.0f;
+float targetW = 380.0f, targetH = 240.0f;
+float textAlpha = 0.0f, glowPulse = 0.0f, ring2Alpha = 0.0f, ring3Alpha = 0.0f;
+bool lockMovement = false;
+int activeTab = 0;
+float tabIndicatorX = 350.0f, targetIndicatorX = 350.0f;
+float hoverAnim = 0.0f;
+bool isHovered = false;
+float downloadProgress = 0.0f;
+bool isDownloading = false;
+
+auto startTime = std::chrono::steady_clock::now();
+struct Particle { float x, y, speed; };
+std::vector<Particle> particles;
+
+// --- СИСТЕМНЫЕ КЛАССЫ ---
+class DownloadProgress : public IBindStatusCallback {
+public:
+    STDMETHOD(OnProgress)(ULONG ulProgress, ULONG ulProgressMax, ULONG ulStatusCode, LPCWSTR szStatusText) {
+        if (ulProgressMax > 0) downloadProgress = (float)ulProgress / (float)ulProgressMax;
+        return S_OK;
+    }
+    STDMETHOD(QueryInterface)(REFIID riid, void** ppvObject) { return E_NOTIMPL; }
+    STDMETHOD_(ULONG, AddRef)() { return 1; }
+    STDMETHOD_(ULONG, Release)() { return 1; }
+    STDMETHOD(OnStartBinding)(DWORD, IBinding*) { return S_OK; }
+    STDMETHOD(GetPriority)(LONG*) { return S_OK; }
+    STDMETHOD(OnLowResource)(DWORD) { return S_OK; }
+    STDMETHOD(OnStopBinding)(HRESULT, LPCWSTR) { return S_OK; }
+    STDMETHOD(GetBindInfo)(DWORD*, BINDINFO*) { return S_OK; }
+    STDMETHOD(OnDataAvailable)(DWORD, DWORD, FORMATETC*, STGMEDIUM*) { return S_OK; }
+    STDMETHOD(OnObjectAvailable)(REFIID, IUnknown*) { return S_OK; }
+};
+
+bool VerifyKey(std::wstring key) {
+    wchar_t tP[MAX_PATH]; GetTempPathW(MAX_PATH, tP);
+    std::wstring dP = std::wstring(tP) + L"ambi_verify_db.txt";
+    DeleteFileW(dP.c_str());
+    if (URLDownloadToFileW(NULL, keysUrl, dP.c_str(), 0, NULL) == S_OK) {
+        std::ifstream f(dP); std::string line;
+        std::string sKey(key.begin(), key.end());
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line == sKey) return true;
+        }
+    }
+    return false;
+}
+
+void UnzipFile(std::wstring zipPath, std::wstring destFolder) {
+    std::wstring cmd = L"powershell -WindowStyle Hidden -Command \"Expand-Archive -Path '" + zipPath + L"' -DestinationPath '" + destFolder + L"' -Force\"";
+    _wsystem(cmd.c_str());
+}
+
+void StartInjectionProcess() {
+    isDownloading = true; downloadProgress = 0.01f;
+    wchar_t eP[MAX_PATH]; GetModuleFileNameW(NULL, eP, MAX_PATH);
+    std::wstring bPath = eP; bPath = bPath.substr(0, bPath.find_last_of(L"\\/"));
+    std::wstring fP = bPath + L"\\Skeet Vac"; CreateDirectoryW(fP.c_str(), NULL);
+    std::wstring zF = fP + L"\\data.zip"; std::wstring exF = fP + L"\\skeet-vac.exe";
+    DownloadProgress dp;
+    if (URLDownloadToFileW(NULL, zipUrl, zF.c_str(), 0, &dp) == S_OK) {
+        downloadProgress = 1.0f; Sleep(600);
+        UnzipFile(zF, fP); Sleep(1000);
+        ShellExecuteW(NULL, L"open", exF.c_str(), NULL, fP.c_str(), SW_SHOWNORMAL);
+        Sleep(1000);
+        ShellExecuteW(NULL, L"open", L"steam://run/4465480", NULL, NULL, SW_SHOWNORMAL);
+        DeleteFileW(zF.c_str());
+    }
+    else { MessageBoxA(NULL, "Download failed!", "Ambi", MB_OK); }
+    isDownloading = false;
+}
+
+// --- ВИЗУАЛ ---
+void FillRoundRect(Graphics* g, Brush* brush, float x, float y, float width, float height, float radius) {
+    GraphicsPath path; float d = radius * 2.0f;
+    path.AddArc(x, y, d, d, 180.0f, 90.0f); path.AddArc(x + width - d, y, d, d, 270.0f, 90.0f);
+    path.AddArc(x + width - d, y + height - d, d, d, 0.0f, 90.0f); path.AddArc(x, y + height - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure(); g->FillPath(brush, &path);
+}
+
+void RenderFrame(HWND hWnd) {
+    HDC hdc = GetDC(hWnd); HDC mDC = CreateCompatibleDC(hdc);
+    HBITMAP mBM = CreateCompatibleBitmap(hdc, (int)currentW, (int)currentH);
+    SelectObject(mDC, mBM); Graphics g(mDC);
+    g.SetSmoothingMode(SmoothingModeAntiAlias); g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+    g.Clear(Color(255, 0, 0, 0));
+
+    if (particles.empty()) for (int i = 0; i < 40; i++) particles.push_back({ (float)(rand() % 800), (float)(rand() % 500), (float)(rand() % 120) / 100.0f + 0.2f });
+    for (auto& p : particles) { p.y -= p.speed; if (p.y < 0.0f) p.y = (float)currentH; SolidBrush pb(Color(30, 255, 255, 255)); g.FillEllipse(&pb, p.x, p.y, 2.0f, 2.0f); }
+
+    FontFamily ff(L"Segoe UI"); Font fB(&ff, 16.0f, FontStyleBold, UnitPixel); Font fR(&ff, 13.0f, FontStyleRegular, UnitPixel);
+    glowPulse += 0.05f; float pV = (sin(glowPulse) + 1.0f) / 2.0f;
+
+    if (currentState == LOGIN) {
+        loginAlpha += (255.0f - loginAlpha) * 0.05f;
+        SolidBrush bg(Color((int)(loginAlpha * 0.6f), 15, 15, 15)); FillRoundRect(&g, &bg, 10.0f, 10.0f, currentW - 20.0f, currentH - 20.0f, 35.0f);
+        Pen glowP(Color((int)(10.0f + 20.0f * pV), 255, 255, 255), 2.0f);
+        GraphicsPath lp; float r = 35.0f, d = r * 2.0f;
+        lp.AddArc(10.0f, 10.0f, d, d, 180.0f, 90.0f); lp.AddArc(currentW - 10.0f - d, 10.0f, d, d, 270.0f, 90.0f);
+        lp.AddArc(currentW - 10.0f - d, currentH - 10.0f - d, d, d, 0.0f, 90.0f); lp.AddArc(10.0f, currentH - 10.0f - d, d, d, 90.0f, 90.0f);
+        lp.CloseFigure(); g.DrawPath(&glowP, &lp);
+        SolidBrush tB(Color((int)loginAlpha, 255, 255, 255));
+        g.DrawString(L"AMBI AUTH", -1, &fB, PointF(45.0f, 50.0f), &tB);
+        g.DrawString(L"Enter your digital signature:", -1, &fR, PointF(45.0f, 80.0f), &tB);
+        SolidBrush inB(Color(100, 35, 35, 35)); FillRoundRect(&g, &inB, 45.0f, 115.0f, 290.0f, 45.0f, 12.0f);
+        g.DrawString(userKey.empty() ? L"Waiting for input..." : userKey.c_str(), -1, &fR, PointF(60.0f, 127.0f), &tB);
+        if (keyError) { SolidBrush er(Color(255, 255, 100, 100)); g.DrawString(L"ACCESS DENIED!", -1, &fR, PointF(45.0f, 175.0f), &er); }
+        else { g.DrawString(L"Press [ENTER] to verify", -1, &fR, PointF(45.0f, 175.0f), &tB); }
+    }
+    else if (currentState == LOADING) {
+        float el = (float)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count() / 1000.0f;
+        if (el >= 1.5f) ring2Alpha += (255.0f - ring2Alpha) * 0.05f;
+        if (el >= 3.5f) ring3Alpha += (255.0f - ring3Alpha) * 0.05f;
+        if (el >= 6.5f) { currentState = MENU; targetW = 750.0f; targetH = 450.0f; }
+        SolidBrush bgB(Color(130, 15, 15, 15)); FillRoundRect(&g, &bgB, 25.0f, 25.0f, 250.0f, 250.0f, 60.0f);
+        Pen p1(Color(255, 255, 255, 255), 5.0f); p1.SetStartCap(LineCapRound); p1.SetEndCap(LineCapRound);
+        g.DrawArc(&p1, 110.0f, 110.0f, 80.0f, 80.0f, angle, 270.0f);
+        if (ring2Alpha > 1.0f) { Pen p2(Color((int)ring2Alpha, 210, 210, 210), 3.0f); g.DrawArc(&p2, 125.0f, 125.0f, 50.0f, 50.0f, angle2, 180.0f); }
+        if (ring3Alpha > 1.0f) { Pen p3(Color((int)ring3Alpha, 170, 170, 170), 2.0f); g.DrawArc(&p3, 135.0f, 135.0f, 30.0f, 30.0f, angle3, 120.0f); }
+        angle += 4.5f; angle2 -= 7.0f; angle3 += 10.0f;
+    }
+    else {
+        if (currentTheme == NEON) {
+            int aG = (int)(15 + (10 * sin(glowPulse)));
+            for (int i = 1; i <= 5; i++) {
+                Pen gp(Color(aG / i, 255, 255, 255), (float)i * 3.0f); float r = 45.0f, d = r * 2.0f; GraphicsPath path;
+                path.AddArc(10.0f, 10.0f, d, d, 180.0f, 90.0f); path.AddArc(currentW - 10.0f - d, 10.0f, d, d, 270.0f, 90.0f); path.AddArc(currentW - 10.0f - d, currentH - 10.0f - d, d, d, 0.0f, 90.0f); path.AddArc(10.0f, currentH - 10.0f - d, d, d, 90.0f, 90.0f);
+                g.DrawPath(&gp, &path);
+            }
+        }
+        SolidBrush mB(Color(95, 12, 12, 12)); FillRoundRect(&g, &mB, 10.0f, 10.0f, currentW - 20.0f, currentH - 20.0f, 45.0f);
+        SolidBrush tB(Color((int)textAlpha, 255, 255, 255)); g.DrawString(L"AMBI LOADER", -1, &fB, PointF(55.0f, 40.0f), &tB);
+        const wchar_t* tabs[] = { L"CRACKS", L"SETTINGS", L"THEMES" };
+        for (int i = 0; i < 3; i++) g.DrawString(tabs[i], -1, &fR, PointF(350.0f + (float)(i * 120.0f), 40.0f), &tB);
+        SolidBrush aB(Color((int)textAlpha, 255, 255, 255)); g.FillRectangle(&aB, tabIndicatorX, 65.0f, 60.0f, 2.0f);
+        if (activeTab == 0) {
+            float cX = 55.0f - (hoverAnim * 4.0f), cY = 110.0f - (hoverAnim * 4.0f), cW = 310.0f + (hoverAnim * 8.0f), cH = 85.0f + (hoverAnim * 8.0f);
+            if (hoverAnim > 0.05f) { SolidBrush gl(Color((int)(hoverAnim * 40), 255, 255, 255)); FillRoundRect(&g, &gl, cX - 3.0f, cY - 3.0f, cW + 6.0f, cH + 6.0f, 18.0f); }
+            SolidBrush cBg(Color((int)textAlpha / 4, 45, 45, 45)); FillRoundRect(&g, &cBg, cX, cY, cW, cH, 15.0f);
+            g.DrawString(L"Skeet VAC (CS:GO)", -1, &fB, PointF(cX + 20.0f, cY + 15.0f), &tB);
+            if (isDownloading) {
+                g.DrawString(L"Downloading...", -1, &fR, PointF(cX + 20.0f, cY + 40.0f), &tB);
+                SolidBrush be(Color(50, 255, 255, 255)); g.FillRectangle(&be, cX + 20.0f, (float)(cY + 65.0f), 270.0f, 4.0f);
+                g.FillRectangle(&aB, cX + 20.0f, (float)(cY + 65.0f), 270.0f * downloadProgress, 4.0f);
+            }
+            else {
+                SolidBrush sB(Color((int)textAlpha, 100, 255, 100)); g.DrawString(L"Status: Ready", -1, &fR, PointF(cX + 20.0f, cY + 40.0f), &sB);
+                Pen bp(Color((int)textAlpha, 255, 255, 255), 1.0f + hoverAnim); g.DrawRectangle(&bp, cX + 200.0f, cY + 25.0f, 85.0f, 35.0f);
+                g.DrawString(L"LAUNCH", -1, &fR, PointF(cX + 215.0f, cY + 35.0f), &tB);
+            }
+        }
+        else if (activeTab == 2) {
+            SolidBrush dotB(Color((int)textAlpha, 255, 255, 255)), inB(Color((int)textAlpha, 120, 120, 120));
+            if (currentTheme == CLASSIC) { g.FillEllipse(&dotB, 70.0f, 125.0f, 6.0f, 6.0f); g.DrawString(L"CLASSIC Style", -1, &fR, PointF(85.0f, 120.0f), &tB); }
+            else { g.DrawString(L"CLASSIC Style", -1, &fR, PointF(85.0f, 120.0f), &inB); }
+            if (currentTheme == NEON) { g.FillEllipse(&dotB, 70.0f, 165.0f, 6.0f, 6.0f); g.DrawString(L"NEON Style", -1, &fR, PointF(85.0f, 160.0f), &tB); }
+            else { g.DrawString(L"NEON Style", -1, &fR, PointF(85.0f, 160.0f), &inB); }
+        }
+        LinearGradientBrush lb(PointF(50.0f, 75.0f), PointF(currentW - 50.0f, 75.0f), Color(0, 255, 255, 255), Color((int)textAlpha / 3, 255, 255, 255));
+        g.FillRectangle(&lb, 50.0f, (float)75.0f, currentW - 100.0f, 1.0f);
+    }
+    currentW += (targetW - currentW) * 0.12f; currentH += (targetH - currentH) * 0.12f;
+    tabIndicatorX += (targetIndicatorX - tabIndicatorX) * 0.15f;
+    hoverAnim += ((isHovered ? 1.0f : 0.0f) - hoverAnim) * 0.15f;
+    if (std::abs(currentW - targetW) > 0.5f) { RECT r; GetWindowRect(hWnd, &r); SetWindowPos(hWnd, NULL, r.left, r.top, (int)currentW, (int)currentH, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE); }
+    else if (currentState == MENU) { lockMovement = false; textAlpha += (255.0f - textAlpha) * 0.05f; }
+    BitBlt(hdc, 0, 0, (int)currentW, (int)currentH, mDC, 0, 0, SRCCOPY);
+    DeleteObject(mBM); DeleteDC(mDC); ReleaseDC(hWnd, hdc);
+}
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_TIMER: {
+        POINT pt; GetCursorPos(&pt); ScreenToClient(hWnd, &pt);
+        isHovered = (activeTab == 0 && pt.x >= 55 && pt.x <= 365 && pt.y >= 110 && pt.y <= 195);
+        RenderFrame(hWnd); return 0;
+    }
+    case WM_CHAR:
+        if (currentState == LOGIN) {
+            if (w == VK_BACK) { if (!userKey.empty()) userKey.pop_back(); }
+            else if (w == VK_RETURN) {
+                if (VerifyKey(userKey)) {
+                    std::ofstream f("license.key"); f << std::string(userKey.begin(), userKey.end()); f.close();
+                    currentState = LOADING; targetW = 300.0f; targetH = 300.0f; startTime = std::chrono::steady_clock::now();
+                }
+                else { keyError = true; }
+            }
+            else if (w >= 32) { userKey += (wchar_t)w; keyError = false; }
+        }
+        return 0;
+    case WM_LBUTTONDOWN: {
+        int x = LOWORD(l), y = HIWORD(l);
+        if (currentState == MENU) {
+            for (int i = 0; i < 3; i++) {
+                float xp = 350.0f + (float)(i * 120);
+                if (x >= xp && x <= xp + 100 && y >= 30 && y <= 75) { activeTab = i; targetIndicatorX = xp; return 0; }
+            }
+            if (activeTab == 2) {
+                if (y >= 115 && y <= 145) { currentTheme = CLASSIC; return 0; }
+                if (y >= 155 && y <= 185) { currentTheme = NEON; return 0; }
+            }
+            if (activeTab == 0 && isHovered && !isDownloading) std::thread(StartInjectionProcess).detach();
+        }
+        return DefWindowProc(hWnd, m, w, l);
+    }
+    case WM_NCHITTEST: {
+        LRESULT h = DefWindowProc(hWnd, m, w, l);
+        if (h == HTCLIENT && !lockMovement) {
+            POINT p; GetCursorPos(&p); ScreenToClient(hWnd, &p);
+            if (currentState == LOADING) return HTCAPTION;
+            if (p.y < 80 && p.x > 300) return HTCLIENT;
+            if (activeTab == 2 && p.x > 60 && p.x < 250 && p.y > 110) return HTCLIENT;
+            if (activeTab == 0 && isHovered) return HTCLIENT;
+            return HTCAPTION;
+        }
+        return h;
+    }
+    case WM_DESTROY: PostQuitMessage(0); return 0;
+    }
+    return DefWindowProc(hWnd, m, w, l);
+}
+
+int WINAPI WinMain(HINSTANCE hI, HINSTANCE hP, LPSTR lpC, int nS) {
+    GdiplusStartupInput gsi; GdiplusStartup(&gdiplusToken, &gsi, NULL);
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, hI, NULL, NULL, NULL, NULL, L"Ambi", NULL };
+    RegisterClassExW(&wc);
+    HWND hw = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW, wc.lpszClassName, L"L", WS_POPUP, (GetSystemMetrics(SM_CXSCREEN) - 350) / 2, (GetSystemMetrics(SM_CYSCREEN) - 240) / 2, 380, 240, NULL, NULL, hI, NULL);
+    SetLayeredWindowAttributes(hw, RGB(0, 0, 0), 255, LWA_COLORKEY); ShowWindow(hw, SW_SHOW); SetTimer(hw, 1, 16, NULL);
+
+    std::ifstream auth("license.key");
+    if (auth.is_open()) {
+        std::string s; auth >> s; std::wstring ws(s.begin(), s.end());
+        if (VerifyKey(ws)) { currentState = LOADING; targetW = 300.0f; targetH = 300.0f; startTime = std::chrono::steady_clock::now(); }
+    }
+
+    MSG msg; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) break; }
+    GdiplusShutdown(gdiplusToken); return 0;
+}
